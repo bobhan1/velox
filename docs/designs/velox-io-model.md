@@ -9,14 +9,22 @@
 - [第一部分：内存-SSD 两层级联缓存](#第一部分内存-ssd-两层级联缓存)
   - [1.1 总体架构与数据通路](#11-总体架构与数据通路)
   - [1.2 内存层：AsyncDataCache](#12-内存层asyncdatacache)
+    - [1.2.0 完整数据流概述](#120-完整数据流概述)
+    - [1.2.1 核心类与 Options](#121-核心类与-options)
+    - [1.2.2 CacheEntry：原子 Pin 状态机](#122-cacheentry原子-pin-状态机)
+    - [1.2.3 CacheShard：分片降低锁争用](#123-cacheshard分片降低锁争用)
     - [1.2.4 内存容量与分配策略](#124-内存容量与分配策略)
     - [1.2.5 驱逐策略：clock + 动态百分位阈值](#125-驱逐策略clock--动态百分位阈值)
-    - [1.2.6 驱逐失败与内存压力应对](#126-驱逐失败与内存压力应对)
+    - [1.2.6 驱逐协调：makeSpace 与反压策略](#126-驱逐协调makespace-与反压策略)
   - [1.3 SSD 层：SsdCache / SsdFile](#13-ssd-层ssdcache--ssdfile)
-    - [1.3.4 SSD 容量与文件增长](#134-ssd-容量与文件增长)
-    - [1.3.5 SSD 写入触发链（从 entry 到 batch）](#135-ssd-写入触发链从-entry-到-batch)
-    - [1.3.6 SSD 侧淘汰：region-based + score-based](#136-ssd-侧淘汰region-based--score-based)
-    - [1.3.7 Checkpoint 与重启恢复](#137-checkpoint-与重启恢复)
+    - [1.3.1 SsdCache 配置](#131-ssdcache-配置)
+    - [1.3.2 SsdRun：紧凑的 [offset|size] 编码](#132-ssdrun紧凑的-offsetsize-编码)
+    - [1.3.3 Entry 在 SSD 上的排布](#133-entry-在-ssd-上的排布)
+    - [1.3.4 异步写入流程](#134-异步写入流程)
+    - [1.3.5 SSD 容量与文件增长](#135-ssd-容量与文件增长)
+    - [1.3.6 SSD 写入触发链（从内存 entry 到 SSD batch）](#136-ssd-写入触发链从内存-entry-到-ssd-batch)
+    - [1.3.7 SSD 侧淘汰：region-based + score-based](#137-ssd-侧淘汰region-based--score-based)
+    - [1.3.8 Checkpoint 与重启恢复](#138-checkpoint-与重启恢复)
   - [1.4 级联查找：Memory → SSD → Storage](#14-级联查找memory--ssd--storage)
   - [1.5 IO 合并：CoalesceIo](#15-io-合并coalesceio)
   - [1.6 预读 / Readahead / Preload](#16-预读--readahead--preload)
@@ -78,6 +86,72 @@ Velox 的缓存栈是一个"三级存储"结构：**内存缓存 → SSD 缓存 
 ---
 
 ## 1.2 内存层：AsyncDataCache
+
+### 1.2.0 完整数据流概述
+
+在深入各组件之前，先看一次完整的 IO 请求如何流经内存层：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ① 上层请求到达：CachedBufferedInput::load()                    │
+│     → 调用 AsyncDataCache::findOrCreate(key)                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ② 查找 shard：shardIdx = hash(key.fileId) & (numShards - 1)    │
+│     → 调用 CacheShard::find(key)                                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+               ┌───────────┴───────────┐
+               │   命中？              │
+               ▼                       ▼
+         [Hit]                   [Miss]
+               │                       │
+               │                       ▼
+               │          ┌────────────────────────────────────┐
+               │          │  ③ 分配新 entry                     │
+               │          │     → allocateExclusive()            │
+               │          │     → 如果内存不足 → makeSpace()    │
+               │          │        → 轮询各 shard::evict()       │
+               │          │        → clock 扫描驱逐冷数据       │
+               │          │     → 成功后拿到 AsyncDataCacheEntry │
+               │          └────────────┬───────────────────────┘
+               │                       │
+               │                       ▼
+               │          ┌────────────────────────────────────┐
+               │          │  ④ 异步读 Storage                   │
+               │          │     → CoalescedLoad::loadOrFuture() │
+               │          │     → 合并邻近请求，减少 IO          │
+               │          │     → 读完后数据进入 entry          │
+               │          └────────────┬───────────────────────┘
+               │                       │
+               │                       ▼
+               │          ┌────────────────────────────────────┐
+               │          │  ⑤ 转为共享状态                      │
+               │          │     → entry->setExclusiveToShared() │
+               │          │     → 如果符合条件，标记 ssdSaveable │
+               │          │     → 累计到阈值后触发 SSD 写入      │
+               │          └────────────┬───────────────────────┘
+               │                       │
+               └───────────────────────┘                               │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  ⑥ SSD 写入触发链（异步，不阻塞读路径）                            │
+│     → possibleSsdSave() 累计 ssdSaveable_ 字节                   │
+│     → 达到阈值后调用 ssdCache_->startWrite()                      │
+│     → saveToSsd() 收集所有 ssdSaveable entry                      │
+│     → ssdCache_->write(pins) 按 fileId 分发到各 SsdFile           │
+│     → executor 异步执行各文件的写入                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键要点**：
+- **读路径**：find → miss → allocate → read → shared
+- **写 SSD 路径**：shared 后异步触发，与读路径完全解耦
+- **驱逐路径**：allocate 失败时同步触发，由 makeSpace 协调多 shard
+
+---
 
 ### 1.2.1 核心类与 Options
 
@@ -173,33 +247,28 @@ void AsyncDataCacheEntry::release() {
 
 ### 1.2.3 CacheShard：分片降低锁争用
 
-每个 shard 是独立的子缓存（`AsyncDataCache.h` 中 `CacheShard` 类，约 `:600-796`）。关键成员：
+每个 shard 是独立的子缓存（`AsyncDataCache.h` 中 `CacheShard` 类，约 `:600-796`）。
 
-- `entries_`：`F14HashMAP` 从 `FileCacheKey` 到 `AsyncDataCacheEntry*`
-- `clockHand_`：clock 算法扫描位置
-- `evictionThreshold_`：动态校准的驱逐阈值
-
-**驱逐算法**（`AsyncDataCache.cpp:515-645` 的 `CacheShard::evict`）：
+**核心成员**：
 
 ```cpp
-uint64_t CacheShard::evict(
-    uint64_t bytesToFree, bool evictAllUnpinned,
-    uint64_t bytesToAcquire, AcquiredMemory& acquired) {
-  // clock 扫描 + 动态阈值
-  auto entryIndex = (clockHand_ % size);
-  int32_t score = candidate->score(now);
-  if (candidate->numPins_ == 0 &&
-      (evictAllUnpinned || score >= evictionThreshold_)) {
-    // SSD-saveable 且非强制全驱逐时，跳过（等后台写 SSD）
-    if (skipSsdSaveable && candidate->ssdSaveable() && !evictAllUnpinned) {
-      continue;
-    }
-    acquireEvictedData(candidate, bytesToAcquire, acquired, ...);
-    removeEntryLocked(candidate);
-    ++numEvict_;
-  }
-}
+class CacheShard {
+  folly::F14FastMap<RawFileCacheKey, std::unique_ptr<AsyncDataCacheEntry>> entries_;
+  uint64_t clockHand_;                    // clock 算法扫描位置
+  int32_t evictionThreshold_;             // 动态校准的驱逐阈值
+  std::vector<int32_t> emptySlots_;       // 空槽位，复用
+  AccessCounter eventCounter_;            // 触发阈值校准的事件计数器
+  int32_t numEvictChecks_;                // 驱逐检查次数
+  int64_t numEvict_;                      // 驱逐成功次数
+  // ...
+};
 ```
+
+**分片路由**：`shardIdx = hash(key.fileId) & (numShards - 1)`，保证同一文件的多个 entry 落在同一 shard。
+
+**独立锁设计**：每个 shard 有独立的 `mutex`，保护其 `entries_` map。这样多线程访问不同 shard 时不会互相阻塞。
+
+**驱逐算法概述**：shard 提供 `evict()` 方法供 `makeSpace` 调用。详细的 clock 扫描和动态阈值逻辑见 §1.2.5。
 
 **AccessStats 打分**（`AsyncDataCache.h` 约 `:72-102`）：
 
@@ -214,62 +283,17 @@ struct AccessStats {
 };
 ```
 
+每个 entry 维护自己的访问统计，驱逐时通过 `score()` 计算优先级。
+
 ### 1.2.4 内存容量与分配策略
 
-**容量来源**：`AsyncDataCache` 本身没有独立的"缓存容量"字段——**总容量就是底层 `MemoryAllocator` 的 `capacity()`**。构造时传入的 allocator 决定了能吃多少内存：
+**容量来源**：`AsyncDataCache` 本身没有独立的"缓存容量"字段——**总容量就是底层 `MemoryAllocator` 的 `capacity()`**。构造时传入的 allocator 决定了能吃多少内存。
 
-```cpp
-// AsyncDataCache.h:844
-AsyncDataCache(
-    const Options& options,
-    memory::MemoryAllocator* allocator,
-    std::unique_ptr<SsdCache> ssdCache = nullptr);
-```
-
-实际使用时，典型初始化路径（见 `velox/benchmarks/QueryBenchmarkBase.cpp:171-178`）：
-
-```cpp
-if (FLAGS_cache_gb) {
-  memory::MemoryManager::Options options;
-  int64_t memoryBytes = FLAGS_cache_gb * (1LL << 30);  // 单位 GB
-  options.useMmapAllocator = true;
-  options.allocatorCapacity = memoryBytes;             // ← 缓存大小来自这里
-  options.useMmapArena = true;
-  options.mmapArenaCapacityRatio = 1;
-  memory::MemoryManager::testingSetInstance(options);
-}
-```
-
-**容量判定**：`canTryAllocate`（`AsyncDataCache.cpp:1037-1048`）用 `allocator_->capacity() - allocator_->numAllocated()` 判断是否还有空间：
-
-```cpp
-bool AsyncDataCache::canTryAllocate(
-    uint64_t requestBytes, const AcquiredMemory& acquired) const {
-  const auto acquiredBytes = acquired.totalBytes();
-  if (requestBytes <= acquiredBytes) return true;
-  return requestBytes - acquiredBytes <=
-      memory::AllocationTraits::pageBytes(
-          memory::AllocationTraits::numPages(allocator_->capacity()) -
-          allocator_->numAllocated());
-}
-```
+**容量判定**：`canTryAllocate` 用 `allocator_->capacity() - allocator_->numAllocated()` 判断是否还有空间。
 
 **分配粒度**：allocator 按 4KB page 分配。
 
-**Entry 三档存储形态**（由 size 自动选择，见 `AsyncDataCache.cpp:146-180` 的 `initialize`）：
-
-```cpp
-if (size_ < AsyncDataCacheEntry::kTinyDataSize) {  // < 2KB
-  tinyData_.resize(size_);                         // 直接 std::string
-  tinyData_.shrink_to_fit();
-  return;
-}
-if (contiguous) {
-  contiguousData_ = cache->allocator()->allocateBytes(size_);  // 连续
-} else {
-  cache->allocator()->allocateNonContiguous(sizePages, nonContiguousData_); // 页段
-}
-```
+**Entry 三档存储形态**（由 size 自动选择）：
 
 | Entry 大小 | 存储形态 | 分配方式 | 适用场景 |
 |---|---|---|---|
@@ -296,29 +320,45 @@ if (contiguous) {
 | `numShards` | **4** | 必须为 2 的幂 |
 | `ssdFlushThresholdBytes` | **0（禁用）** | 可选的"硬阈值"，超过立即 flush |
 
+**分配失败时的处理**：当 `canTryAllocate` 返回 false 时，表示内存不足。此时会调用 **`makeSpace`** 来腾出空间。
+
+`makeSpace` 是整个内存管理的核心协调函数，它：
+1. 轮询各 shard 调用 `evict()` 驱逐冷数据
+2. 重试分配
+3. 如果多次失败，逐步加大驱逐量并进入反压模式
+
+`makeSpace` 的详细实现在 §1.2.6 中展开。
+
 ### 1.2.5 驱逐策略：clock + 动态百分位阈值
+
+上一节提到，当 `makeSpace` 轮询各 shard 时，会调用 `CacheShard::evict()` 来腾出空间。本节详细分析驱逐算法的实现。
 
 **触发时机**：驱逐**不是后台定时任务**，而是**分配失败时同步触发**。当一次 `findOrCreate` 需要新内存、而 allocator 没空闲页时，走 `makeSpace` → 轮询各 shard 的 `evict`。
 
 **clock 扫描主循环**（`AsyncDataCache.cpp:536-593`）：
 
 ```cpp
-auto entryIndex = (clockHand_ % size);
-auto iter = entries_.begin() + entryIndex;
-while (++counter <= size) {
-  if (++iter == entries_.end()) { iter = entries_.begin(); entryIndex = 0; }
-  else { ++entryIndex; }
-  ++clockHand_;                       // 永远推进
+uint64_t CacheShard::evict(
+    uint64_t bytesToFree, bool evictAllUnpinned,
+    uint64_t bytesToAcquire, AcquiredMemory& acquired) {
+  auto entryIndex = (clockHand_ % size);
+  auto iter = entries_.begin() + entryIndex;
+  while (++counter <= size) {
+    if (++iter == entries_.end()) { iter = entries_.begin(); entryIndex = 0; }
+    else { ++entryIndex; }
+    ++clockHand_;                       // 永远推进
 
-  int32_t score = candidate->score(now);
-  if (candidate->numPins_ == 0 &&
-      (evictAllUnpinned || score >= evictionThreshold_)) {
-    if (skipSsdSaveable && candidate->ssdSaveable() && !evictAllUnpinned) {
-      continue;                       // 等 SSD 写完再扔
+    int32_t score = candidate->score(now);
+    if (candidate->numPins_ == 0 &&
+        (evictAllUnpinned || score >= evictionThreshold_)) {
+      if (skipSsdSaveable && candidate->ssdSaveable() && !evictAllUnpinned) {
+        continue;                       // 等 SSD 写完再扔
+      }
+      acquireEvictedData(candidate, ...);
+      removeEntryLocked(candidate);
+      ++numEvict_;
+      if (largeEvicted + tinyEvicted > bytesToFree) break;
     }
-    acquireEvictedData(candidate, ...);
-    removeEntryLocked(candidate);
-    ++numEvict_;
   }
 }
 ```
@@ -339,13 +379,15 @@ void CacheShard::calibrateThresholdLocked() {
 - `kEvictionPercentile = 80`：取 80 分位数作为阈值
 - 触发频率：每 `entries_.size() / 4` 次 evict 事件 或 `entries_.size() / 8` 次检查时重新校准
 
-**这意味着**：阈值不是静态数字，而是**根据当前 workload 自适应**。如果 80% 的 entry 都很冷，阈值会自然升高，驱逐更激进；如果大部分 entry 都很热，阈值降低，驱逐保守。
+**自适应特性**：阈值不是静态数字，而是**根据当前 workload 自适应**。如果 80% 的 entry 都很冷，阈值会自然升高，驱逐更激进；如果大部分 entry 都很热，阈值降低，驱逐保守。
 
 **SSD-saveable 跳过逻辑**：当一个 entry 被标记 `ssdSaveable_` 但还没写入 SSD 时，普通驱逐会跳过它——等后台写完再扔，避免丢掉"刚要落到 SSD"的数据。只有 `evictAllUnpinned=true`（紧急模式）才会强制驱逐。
 
-### 1.2.6 驱逐失败与内存压力应对
+### 1.2.6 驱逐协调：makeSpace 与反压策略
 
-`makeSpace`（`AsyncDataCache.cpp:900-995`）是整个反压策略的总入口：
+上一节详细介绍了单 shard 内的驱逐算法。本节看 `makeSpace` 如何协调多 shard 驱逐，以及在内存吃紧时如何反压。
+
+`makeSpace`（`AsyncDataCache.cpp:900-995`）是整个反压策略的总入口。它在 `allocateExclusive` 分配失败时被调用：
 
 ```cpp
 bool AsyncDataCache::makeSpace(
@@ -405,11 +447,28 @@ bool AsyncDataCache::makeSpace(
 
 **最终失败**：如果 16 次都腾不出空间 → 返回 false，上层（`findOrCreate` 调用方）会走"无缓存"路径直接读 storage，**不让查询失败**——cache miss 但功能正常。
 
-**强制驱逐（紧急模式）**：在 `CacheShard::evict` 时如果 `evictAllUnpinned=true`，会跳过所有阈值检查，强制扔掉未 pin 的 entry——这是内存极度紧张时的最后手段。
+**强制驱逐（紧急模式）**：在 `CacheShard::evict` 时如果 `evictAllUnpinned=true`，会跳过所有阈值检查，强制扔掉未 pin 的 entry——这是内存极度紧张时的最后手段。`makeSpace` 在遍历完一轮所有 shard 后（`nthAttempt >= numShards_`），会设置 `evictAllUnpinned=true`。
 
 ---
 
 ## 1.3 SSD 层：SsdCache / SsdFile
+
+在 §1.2.0 的数据流图中，我们看到内存层的 entry 在转为共享状态后，如果标记了 `ssdSaveable_`，会异步写入 SSD。本节详细展开 SSD 层的设计。
+
+**SSD 层的核心职责**：
+1. 接收内存层下发的 entry 批量写入请求
+2. 按 region（64MB）管理磁盘空间
+3. 提供基于 key 的查找（读 SSD 回内存）
+4. 容量不足时淘汰 region，腾出空间
+
+**与内存层的关系**：SSD 是内存的"溢出区"，不是独立缓存。内存层负责查找和驱逐逻辑，SSD 层只负责存储和空间管理。
+
+**写入触发回顾**（完整流程见 §1.3.5）：
+- 内存层 entry 写完后调用 `setExclusiveToShared()`
+- 如果 `FileGroupStats` 认可，标记 `ssdSaveable_ = true`
+- 累计达到阈值后调用 `possibleSsdSave()` → `saveToSsd()` → `SsdCache::write()`
+
+---
 
 ### 1.3.1 SsdCache 配置
 
@@ -454,7 +513,39 @@ class SsdRun {
 
 41 位 offset = 2TB 单文件寻址；23 位 size = 最大 8MB 单条目，这与内存层的 entry 大小保持一致。
 
-### 1.3.3 异步写入流程
+### 1.3.3 Entry 在 SSD 上的排布
+
+理解 entry 如何在磁盘上排列很重要：
+
+**Region 划分**：每个 SSD 文件内部按 **64MB region** 划分（`kRegionSize = 1 << 26`）。
+
+**顺序写入**：一批 pins（从内存层收集而来）在同一个 region 内**顺序追加**。`SsdFile::getSpace()` 负责分配空间：
+
+```cpp
+std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
+    const std::vector<CachePin>& pins, int32_t begin) {
+  const auto region = writableRegions_[0];
+  const auto offset = regionSizes_[region];  // 当前 region 的写位置
+
+  // 当前 region 装得下这批 pins 吗？
+  //   装得下 → 分配 offset，继续用这个 region
+  //   装不下 → 该 region 标记 filled，切下一个 region
+  if (regionFilled) {
+    tracker_.regionFilled(region);
+    writableRegions_.erase(writableRegions_.begin());
+  }
+  return {region * kRegionSize + offset, toWrite};
+}
+```
+
+**这意味着**：
+- 同一批写入的 pins 紧密排列在同一个 region
+- 一个 region 写满后才切换到下一个
+- 避免了碎片，读时可以做连续 IO
+
+**查找时**：通过 `entries_` map（`FileCacheKey → SsdRun`）找到 entry 的 offset 和 size，再读回内存。
+
+### 1.3.4 异步写入流程
 
 `velox/common/caching/SsdCache.cpp:97-149` 的 `SsdCache::write`：
 
@@ -480,7 +571,7 @@ void SsdCache::write(std::vector<CachePin> pins) {
 
 写入是**批量、异步、分片并行**的：调用方一次 submit 多个 pin，SsdCache 按 shard 分桶后投递到 folly executor，各 SSD 文件并发写入。
 
-### 1.3.4 SSD 容量与文件增长
+### 1.3.5 SSD 容量与文件增长
 
 **容量来源**：`SsdCache::Config::maxBytes`，完全由配置决定（不同于内存层"继承" allocator 容量）。典型初始化（`velox/benchmarks/QueryBenchmarkBase.cpp:180-190`）：
 
@@ -561,7 +652,9 @@ bool SsdFile::growOrEvictLocked() {
 | `checksumEnabled` | false | 写时计算 checksum |
 | `checksumReadVerificationEnabled` | false | 读时校验 |
 
-### 1.3.5 SSD 写入触发链（从 entry 到 batch）
+### 1.3.6 SSD 写入触发链（从内存 entry 到 SSD batch）
+
+前面几节介绍了 SSD 层的结构和写入机制。本节回头看"内存层如何触发 SSD 写入"，把整个链路串起来。
 
 整个触发链是"**累计 + 阈值 + 去重**"的链式反应：
 
@@ -587,7 +680,7 @@ bool SsdFile::growOrEvictLocked() {
         │  单批最多 maxWriteRatio × shard.size() 个（默认 70%）
         ▼
 ⑥ ssdCache_->write(pins)
-        │  按 fileId % numShards 分发到各 SsdFile
+        │  按 fileId % numShards 分发到各 SsdFile（见 §1.3.4）
         ▼
 ⑦ executor_->add(...) 异步写每个 SsdFile
         │  写完后给 entry 挂上 ssdFile_/ssdOffset_
@@ -649,7 +742,7 @@ bool shouldSaveToSsd(uint64_t groupId, TrackingId trackingId) const {
 
 `groupId` / `trackingId` 是 entry 的分组标签（文件级、scan 级等）。当前开源版本默认全放行，预留接口让生产环境按热度过滤。`AsyncDataCache::incrementNew` 会周期性调用 `updateSsdFilter(ssdMaxBytes × 0.9)`（`AsyncDataCache.cpp:1059-1071`）重新校准过滤策略。
 
-### 1.3.6 SSD 侧淘汰：region-based + score-based
+### 1.3.7 SSD 侧淘汰：region-based + score-based
 
 SSD 的淘汰单位不是单条 entry，而是**整个 64MB region**。这是 SSD 特性决定的——一次 `ftruncate` 的大段回收比逐条 overwrite 高效得多。
 
@@ -703,11 +796,20 @@ std::vector<int32_t> SsdFileTracker::findEvictionCandidates(
 - **平均分作阈值**：只淘汰"低于平均热度"的 region
 - **pin 保护**：region 上有正在读的 entry 时，整 region 不可淘汰
 
-**淘汰时的数据一致性**：
+**淘汰后的数据一致性**：
+
+用户问到"SSD region 被淘汰之后里面就是直接丢掉了吗？"——答案是：**是的，直接丢弃**。
+
+淘汰流程（`SsdFile::growOrEvictLocked`）：
 1. `logEviction(candidates)` 写 eviction log（持久化）——下次重启时读 checkpoint + 重放 eviction log 就能知道哪些 region 失效了
-2. `clearRegionEntriesLocked` 清理 in-memory 的 entry map
+2. `clearRegionEntriesLocked` 清理 in-memory 的 `entries_` map
 3. `writableRegions_ = candidates` 回收的 region 加入可写队列
 4. **被淘汰 region 里的 entry 不做"回写内存"**——内存里如果还有对应 CachePin，数据继续从内存读；内存里没有就等下次 cache miss 重读 storage
+
+**为什么不用回写内存？**
+- 被淘汰的 region 里的数据本来就冷（score 低）
+- 内存层驱逐时已经触发过 SSD 写入，内存里应该已经没有这些 entry
+- 如果内存里还有（比如刚读进来没来得及驱逐），继续从内存读即可
 
 **SsdFile::write() 如何选位置**（`SsdFile.cpp:256-340` 的 `getSpace`）：
 
@@ -731,9 +833,7 @@ std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
 }
 ```
 
-**写入是顺序追加**：一个 region 装满后才切下一个，避免碎片。
-
-### 1.3.7 Checkpoint 与重启恢复
+### 1.3.8 Checkpoint 与重启恢复
 
 **Checkpoint 机制**：每隔 `checkpointIntervalBytes` 字节做一次持久化（`SsdFile.h:509-519`）：
 
