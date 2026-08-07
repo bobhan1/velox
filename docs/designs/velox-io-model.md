@@ -87,9 +87,7 @@ Velox 的缓存栈是一个"三级存储"结构：**内存缓存 → SSD 缓存 
 
 ## 1.2 内存层：AsyncDataCache
 
-### 1.2.0 完整数据流概述
-
-在深入各组件之前，先看一次完整的 IO 请求如何流经内存层：
+### 1.2.0 数据流概述
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -146,7 +144,6 @@ Velox 的缓存栈是一个"三级存储"结构：**内存缓存 → SSD 缓存 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**关键要点**：
 - **读路径**：find → miss → allocate → read → shared
 - **写 SSD 路径**：shared 后异步触发，与读路径完全解耦
 - **驱逐路径**：allocate 失败时同步触发，由 makeSpace 协调多 shard
@@ -266,7 +263,7 @@ class CacheShard {
 
 **分片路由**：`shardIdx = hash(key.fileId) & (numShards - 1)`，保证同一文件的多个 entry 落在同一 shard。
 
-**独立锁设计**：每个 shard 有独立的 `mutex`，保护其 `entries_` map。这样多线程访问不同 shard 时不会互相阻塞。
+**独立锁设计**：每个 shard 有独立的 `mutex` 保护其 `entries_` map，多线程访问不同 shard 时不阻塞。
 
 **驱逐算法概述**：shard 提供 `evict()` 方法供 `makeSpace` 调用。详细的 clock 扫描和动态阈值逻辑见 §1.2.5。
 
@@ -331,7 +328,7 @@ struct AccessStats {
 
 ### 1.2.5 驱逐策略：clock + 动态百分位阈值
 
-上一节提到，当 `makeSpace` 轮询各 shard 时，会调用 `CacheShard::evict()` 来腾出空间。本节详细分析驱逐算法的实现。
+当 `makeSpace` 轮询各 shard 时，会调用 `CacheShard::evict()` 腾出空间。
 
 **触发时机**：驱逐**不是后台定时任务**，而是**分配失败时同步触发**。当一次 `findOrCreate` 需要新内存、而 allocator 没空闲页时，走 `makeSpace` → 轮询各 shard 的 `evict`。
 
@@ -385,7 +382,7 @@ void CacheShard::calibrateThresholdLocked() {
 
 ### 1.2.6 驱逐协调：makeSpace 与反压策略
 
-上一节详细介绍了单 shard 内的驱逐算法。本节看 `makeSpace` 如何协调多 shard 驱逐，以及在内存吃紧时如何反压。
+本节介绍 `makeSpace` 如何协调多 shard 驱逐，以及在内存吃紧时的反压策略。
 
 `makeSpace`（`AsyncDataCache.cpp:902-989`）是整个反压策略的总入口。它在 `allocateExclusive` 分配失败时被调用：
 
@@ -453,7 +450,7 @@ bool AsyncDataCache::makeSpace(
 
 ## 1.3 SSD 层：SsdCache / SsdFile
 
-在 §1.2.0 的数据流图中，我们看到内存层的 entry 在转为共享状态后，如果标记了 `ssdSaveable_`，会异步写入 SSD。本节详细展开 SSD 层的设计。
+内存层的 entry 在转为共享状态后，若标记了 `ssdSaveable_`，会异步写入 SSD。
 
 **SSD 层的核心职责**：
 1. 接收内存层下发的 entry 批量写入请求
@@ -515,8 +512,6 @@ class SsdRun {
 
 ### 1.3.3 Entry 在 SSD 上的排布
 
-理解 entry 如何在磁盘上排列很重要：
-
 **Region 划分**：每个 SSD 文件内部按 **64MB region** 划分（`kRegionSize = 1 << 26`）。
 
 **顺序写入**：一批 pins（从内存层收集而来）在同一个 region 内**顺序追加**。`SsdFile::getSpace()` 负责分配空间：
@@ -538,10 +533,10 @@ std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
 }
 ```
 
-**这意味着**：
+**写入特性**：
 - 同一批写入的 pins 紧密排列在同一个 region
 - 一个 region 写满后才切换到下一个
-- 避免了碎片，读时可以做连续 IO
+- 避免碎片，读时支持连续 IO
 
 **查找时**：通过 `entries_` map（`FileCacheKey → SsdRun`）找到 entry 的 offset 和 size，再读回内存。
 
@@ -597,7 +592,7 @@ const int32_t fileMaxRegions =
     bits::roundUp(config.maxBytes, sizeQuantum) / sizeQuantum;
 ```
 
-即每个 SSD 文件的最大 region 数 = `maxBytes / (numShards × 64MB)`。例：`maxBytes=200GB`、`numShards=16` → 对齐到整 1GB 倍数。
+每个 SSD 文件的最大 region 数 = `maxBytes / (numShards × 64MB)`。`maxBytes=200GB`、`numShards=16` → 对齐到整 1GB 倍数。
 
 **Lazy 增长**：SSD 文件不是启动时一次性预分配，而是**按需 grow**。`SsdFile::growOrEvictLocked`（`SsdFile.cpp:293-340`）先尝试扩文件，扩不了再淘汰：
 
@@ -654,7 +649,7 @@ bool SsdFile::growOrEvictLocked() {
 
 ### 1.3.6 SSD 写入触发链（从内存 entry 到 SSD batch）
 
-前面几节介绍了 SSD 层的结构和写入机制。本节回头看"内存层如何触发 SSD 写入"，把整个链路串起来。
+本节介绍"内存层如何触发 SSD 写入"的完整链路。
 
 整个触发链是"**累计 + 阈值 + 去重**"的链式反应：
 
@@ -1316,7 +1311,7 @@ if (foundEntry->isPrefetch()) {
 }
 ```
 
-**Prefetch 首次命中不计入 hit**：因为 entry 是预读放进来的，第一次访问只是"消费预读"，不能算真正的命中——这样统计出来的 hit rate 更能反映 reader 的实际 cache 利用情况。
+**Prefetch 首次命中不计入 hit**：entry 预读后第一次访问仅消费预读，不算命中，使 hit rate 统计反映实际 cache 利用。
 
 `CacheStats` 字段（在 `CacheShard` 和 `AsyncDataCache` 上各一份）：
 
@@ -1398,7 +1393,7 @@ if (foundEntry->isPrefetch()) {
             └──────────────────┘
 ```
 
-本部分关注从 **Reader 到 BufferedInput** 这段——即格式层如何组织请求、如何并发、如何预读。
+本部分介绍从 **Reader 到 BufferedInput** 的请求组织、并发和预读机制。
 
 ---
 
@@ -1461,7 +1456,7 @@ class BufferedInput {
 };
 ```
 
-**两阶段的价值**：reader 先 `enqueue` 所有要读的 column region，再 `load` 一次——`load` 内部有机会合并、去重、预读。如果每次 read 都立即发 IO，就无法跨 column 合并了。
+**两阶段设计**：reader 先 `enqueue` 所有要读的 column region，再 `load` 一次——`load` 内部有机会合并、去重、预读。每次 read 立即发 IO 无法跨 column 合并。
 
 ### 2.3.2 CachedBufferedInput：带缓存的实现
 
@@ -1556,8 +1551,8 @@ void ReaderBase::scheduleRowGroups(
 
 **并发机制**：
 - `prefetchRowGroups` 控制预读窗口大小（默认值在 `ReaderOptions`）
-- 当前 row group 正在被解码时，下一批 row group 的 IO 已经在 executor 上飞
-- 上一个 row group 处理完立即 `erase`，释放内存
+- 当前 row group 解码时，下一批 row group 的 IO 在 executor 上异步执行
+- 上一个 row group 处理完立即 `erase` 释放内存
 
 ### 2.4.3 loadRowGroup：列递归 enqueue
 
@@ -1585,7 +1580,7 @@ void StructColumnReader::enqueueRowGroup(uint32_t index, BufferedInput& input) {
 }
 ```
 
-**关键点**：**同一个 row group 内所有列的 region 共享一个 BufferedInput 实例**，所以 `load()` 调用一次就把这些列的 IO 合并下发。这就是 Parquet 列存"一次合并多个列"的并发模型。
+同一个 row group 内所有列的 region 共享一个 BufferedInput 实例，`load()` 调用一次完成多列 IO 合并下发。
 
 ### 2.4.4 PageReader：页级读取
 
@@ -1609,7 +1604,7 @@ class PageReader {
 };
 ```
 
-页级别已经不直接产生 IO——PageReader 从 column chunk 的 `SeekableInputStream`（即 `CacheInputStream`）顺序读取。**IO 全部发生在 `load()` 阶段**，PageReader 只负责解码。
+页级别不直接产生 IO——PageReader 从 column chunk 的 `SeekableInputStream`（即 `CacheInputStream`）顺序读取。**IO 全部发生在 `load()` 阶段**，PageReader 负责解码。
 
 ### 2.4.5 Parquet 整体流程
 
@@ -1703,7 +1698,7 @@ class DwrfUnit : public LoadUnit {
 };
 ```
 
-`load()` / `unload()` 的对称设计让 UnitLoader 可以**像滑动窗口一样**管理 stripe：进的来 decode，出去的立即释放内存。
+`load()` / `unload()` 对称设计让 UnitLoader 以滑动窗口管理 stripe：进来的 decode，出去的立即释放内存。
 
 ### 2.5.3 UnitLoader：滑动窗口策略
 
@@ -1834,7 +1829,7 @@ class TableScan : public SourceOperator {
 };
 ```
 
-`future_` 是**反压信号**：当 reader 无法立即返回数据（比如等 IO）时，给 scan 一个 future，scan 会把控制权交还调度器，等 future ready 再继续。这样 IO 慢的 task 不会占住 driver 线程。
+`future_` 是**反压信号**：reader 无法立即返回数据时，给 scan 一个 future，scan 把控制权交还调度器，等 future ready 再继续，避免 IO 慢的 task 占住 driver 线程。
 
 ### 2.6.2 HiveDataSource → FileSplitReader
 
