@@ -217,7 +217,7 @@ class AsyncDataCacheEntry {
                                             └──────────────┘
 ```
 
-**关键操作**（`velox/common/caching/AsyncDataCache.cpp:76-132`）：
+**关键操作**（`velox/common/caching/AsyncDataCache.cpp:76-127`）：
 
 ```cpp
 void AsyncDataCacheEntry::setExclusiveToShared(bool ssdSavable) {
@@ -335,7 +335,7 @@ struct AccessStats {
 
 **触发时机**：驱逐**不是后台定时任务**，而是**分配失败时同步触发**。当一次 `findOrCreate` 需要新内存、而 allocator 没空闲页时，走 `makeSpace` → 轮询各 shard 的 `evict`。
 
-**clock 扫描主循环**（`AsyncDataCache.cpp:536-593`）：
+**clock 扫描主循环**（`AsyncDataCache.cpp:517-594`）：
 
 ```cpp
 uint64_t CacheShard::evict(
@@ -363,7 +363,7 @@ uint64_t CacheShard::evict(
 }
 ```
 
-**动态阈值校准**（`AsyncDataCache.cpp:624-645` 的 `calibrateThresholdLocked`）：
+**动态阈值校准**（`AsyncDataCache.cpp:626-647` 的 `calibrateThresholdLocked`）：
 
 ```cpp
 void CacheShard::calibrateThresholdLocked() {
@@ -387,7 +387,7 @@ void CacheShard::calibrateThresholdLocked() {
 
 上一节详细介绍了单 shard 内的驱逐算法。本节看 `makeSpace` 如何协调多 shard 驱逐，以及在内存吃紧时如何反压。
 
-`makeSpace`（`AsyncDataCache.cpp:900-995`）是整个反压策略的总入口。它在 `allocateExclusive` 分配失败时被调用：
+`makeSpace`（`AsyncDataCache.cpp:902-989`）是整个反压策略的总入口。它在 `allocateExclusive` 分配失败时被调用：
 
 ```cpp
 bool AsyncDataCache::makeSpace(
@@ -688,7 +688,7 @@ bool SsdFile::growOrEvictLocked() {
 ⑧ writesInProgress_ 归零 → 日志 + 解锁
 ```
 
-**核心阈值判定**（`AsyncDataCache.cpp:1073-1095`）：
+**核心阈值判定**（`AsyncDataCache.cpp:1075-1097`）：
 
 ```cpp
 void AsyncDataCache::possibleSsdSave(uint64_t bytes) {
@@ -710,7 +710,7 @@ void AsyncDataCache::possibleSsdSave(uint64_t bytes) {
 }
 ```
 
-**单批限量**（`AsyncDataCache.cpp:695-719` 的 `appendSsdSaveable`）：
+**单批限量**（`AsyncDataCache.cpp:697-721` 的 `appendSsdSaveable`）：
 
 ```cpp
 void CacheShard::appendSsdSaveable(bool saveAll, std::vector<CachePin>& pins) {
@@ -740,7 +740,7 @@ bool shouldSaveToSsd(uint64_t groupId, TrackingId trackingId) const {
 }
 ```
 
-`groupId` / `trackingId` 是 entry 的分组标签（文件级、scan 级等）。当前开源版本默认全放行，预留接口让生产环境按热度过滤。`AsyncDataCache::incrementNew` 会周期性调用 `updateSsdFilter(ssdMaxBytes × 0.9)`（`AsyncDataCache.cpp:1059-1071`）重新校准过滤策略。
+`groupId` / `trackingId` 是 entry 的分组标签（文件级、scan 级等）。当前开源版本默认全放行，预留接口让生产环境按热度过滤。`AsyncDataCache::incrementNew` 会周期性调用 `updateSsdFilter(ssdMaxBytes × 0.9)`（`AsyncDataCache.cpp:1058-1073`）重新校准过滤策略。
 
 ### 1.3.7 SSD 侧淘汰：region-based + score-based
 
@@ -1158,7 +1158,7 @@ class CoalescedLoad {
 
 ### 1.7.3 makeSpace：反压与回退
 
-当内存吃紧时，`AsyncDataCache::makeSpace`（`AsyncDataCache.cpp:900-995`）展现了完整的反压策略：
+当内存吃紧时，`AsyncDataCache::makeSpace`（`AsyncDataCache.cpp:902-989`）展现了完整的反压策略：
 
 ```cpp
 bool AsyncDataCache::makeSpace(
@@ -1264,7 +1264,7 @@ class FileGroupStats {
 - 每次 reference（引用）和 read（实际读）都记录，算出"读密度"
 - `shouldSaveToSsd()` 是真实 SSD 准入判定的入口；开源版本默认 true，生产侧可插入策略
 
-**SSD 准入过滤器周期更新**（`AsyncDataCache.cpp:1059-1071` 的 `incrementNew`）：
+**SSD 准入过滤器周期更新**（`AsyncDataCache.cpp:1058-1073` 的 `incrementNew`）：
 
 ```cpp
 void AsyncDataCache::incrementNew(uint64_t size) {
@@ -1982,4 +1982,4 @@ class FileSplitReader {
 
 ---
 
-*本文档基于Velox `bh-play` 分支源码撰写，所有代码引用均带 `文件:行号` 锚点。*
+*本文档基于 Velox main 分支 commit `a0bf9327` 撰写，所有代码引用均带 `文件:行号` 锚点。*
