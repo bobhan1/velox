@@ -1,6 +1,33 @@
 # Velox IO 模型详解：从两级缓存到格式层并发
 
-本文件从两个维度剖析 Velox 的 IO 栈：**(1)** 以 `AsyncDataCache` + `SsdCache` 为核心的两层级联缓存机制（含 IO 合并、预读、并发与反压）；**(2)** 上层格式读取器（Parquet / DWRF 等）向下层提交 IO 的并发模型与各格式特有的读取流程。所有代码引用均带 `文件:行号` 锚点，便于跳转核对。
+本文从两个维度剖析 Velox 的 IO 栈：**(1)** 以 `AsyncDataCache` + `SsdCache` 为核心的两层级联缓存机制（含 IO 合并、预读、并发与反压）；**(2)** 上层格式读取器（Parquet / DWRF 等）向下层提交 IO 的并发模型。所有代码引用均带 `文件:行号` 锚点。
+
+## 背景与动机
+
+**Velox** 是 Meta 开源的统一执行引擎，用于处理大规模数据分析。在云端场景中，数据通常存储在远程存储系统（如 S3、HDFS），访问延迟高。为了降低延迟，Velox 实现了两层级联缓存：
+
+- **内存缓存（L1）**：最快的访问，但容量有限
+- **SSD 缓存（L2）**：内存的溢出区，容量更大但稍慢
+
+本文档详细描述这套缓存机制的设计与实现，以及上层格式如何通过并发 IO 最大化吞吐。
+
+## 核心术语速查
+
+| 术语 | 含义 |
+|------|------|
+| **Entry** | 缓存条目，代表 `{fileId, offset}` 标识的连续数据区域 |
+| **Pin** | 对 Entry 的引用标记，通过引用计数（`numPins_`）防止被驱逐 |
+| **Shard** | 缓存分片，按 `fileId % numShards` 哈希，每片独立锁 |
+| **Region** | SSD 文件的 64MB 划分单位，淘汰的基本粒度 |
+| **Row Group** | Parquet 文件的行分组单元，包含所有列的数据块 |
+| **Stripe** | DWRF/ORC 文件的行分组单元，类似 Row Group |
+| **CoalescedLoad** | IO 去重器，合并相同区域的多并发请求 |
+
+## 阅读路径建议
+
+- **快速理解**（约 15 分钟）：1.1 → 1.4 → 2.1 → 2.7
+- **深入实现**：按章节顺序阅读
+- **问题导向**：根据目录跳转到相关章节
 
 ---
 
@@ -34,6 +61,10 @@
   - [2.1 抽象层次总览](#21-抽象层次总览)
   - [2.2 Reader / RowReader / ColumnReader 三层体系](#22-reader--rowreader--columnreader-三层体系)
   - [2.3 BufferedInput 与 CachedBufferedInput](#23-bufferedinput-与-cachedbufferedinput)
+    - [2.3.1 BufferedInput：两阶段加载](#231-bufferedinput两阶段加载)
+    - [2.3.2 CachedBufferedInput：带缓存的实现](#232-cachedbufferedinput带缓存的实现)
+    - [2.3.3 CacheRequest 数据结构](#233-cacherequest-数据结构)
+    - [2.3.4 CacheInputStream：IO 结果的流式封装](#234-cacheinputstreamio-结果的流式封装)
   - [2.4 Parquet：Row Group 调度与列并发](#24-parquetrow-group-调度与列并发)
   - [2.5 DWRF/ORC：Stripe 与 UnitLoader](#25-dwrforcstripe-与-unitloader)
   - [2.6 Scan 算子到 Reader 的协同](#26-scan-算子到-reader-的协同)
@@ -79,9 +110,14 @@ Velox 的缓存栈是一个"三级存储"结构：**内存缓存 → SSD 缓存 
 ```
 
 **关键设计**：
-- **内存缓存是主体**：SSD 是附属层，只在内存吃紧时才发挥价值。`SsdCache` 通过 `std::unique_ptr<SsdCache> ssdCache_` 持有，可以为 `nullptr`（见 `velox/common/caching/AsyncDataCache.h:1033`）。
-- **Sharded 设计降低锁争用**：内存缓存按 `key.fileId % numShards` 哈希到固定 shard，每个 shard 有独立 mutex 与 eviction clock。
-- **SSD 异步写入**：evict 时如果 entry 标记了 `ssdSaveable_`，不直接丢弃，而是通过 executor 异步写到 SSD。
+- **内存缓存是主体**：SSD 是附属层，只在内存吃紧时发挥作用。
+- **Sharded 设计**：按 `fileId % numShards` 哈希到固定 shard，每个 shard 独立锁，降低争用。
+- **SSD 异步写入**：evict 时标记 `ssdSaveable_` 的 entry 异步写到 SSD，不阻塞读路径。
+
+**核心组件**：
+- **AsyncDataCache**：内存缓存层，负责 Entry 分配、驱逐和 SSD 下发决策
+- **SsdCache**：SSD 缓存层入口，批量写入和 region 淘汰
+- **CachePin**：对 Entry 的引用，持有数据期间 entry 不可被驱逐
 
 ---
 
@@ -330,7 +366,13 @@ struct AccessStats {
 
 当 `makeSpace` 轮询各 shard 时，会调用 `CacheShard::evict()` 腾出空间。
 
-**触发时机**：驱逐**不是后台定时任务**，而是**分配失败时同步触发**。当一次 `findOrCreate` 需要新内存、而 allocator 没空闲页时，走 `makeSpace` → 轮询各 shard 的 `evict`。
+**设计选择：为什么用 clock 算法而非 LRU？**
+- Clock 算法是 LRU 的近似实现
+- 避免维护全局时间戳的开销
+- 指针像时钟一样转动扫描，每个 entry 只需维护一个 bit（隐式在 `clockHand_` 位置中）
+- 对并发更友好，无需全局同步
+
+**触发时机**：驱逐**不是后台定时任务**，而是**分配失败时同步触发**。
 
 **clock 扫描主循环**（`AsyncDataCache.cpp:517-594`）：
 
@@ -376,7 +418,7 @@ void CacheShard::calibrateThresholdLocked() {
 - `kEvictionPercentile = 80`：取 80 分位数作为阈值
 - 触发频率：每 `entries_.size() / 4` 次 evict 事件 或 `entries_.size() / 8` 次检查时重新校准
 
-**自适应特性**：阈值不是静态数字，而是**根据当前 workload 自适应**。如果 80% 的 entry 都很冷，阈值会自然升高，驱逐更激进；如果大部分 entry 都很热，阈值降低，驱逐保守。
+**自适应特性**：阈值不是静态数字，而是**根据当前 workload 自适应**。冷数据占比较高时，阈值升高，驱逐更激进；热数据占比较高时，阈值降低，驱逐保守。
 
 **SSD-saveable 跳过逻辑**：当一个 entry 被标记 `ssdSaveable_` 但还没写入 SSD 时，普通驱逐会跳过它——等后台写完再扔，避免丢掉"刚要落到 SSD"的数据。只有 `evictAllUnpinned=true`（紧急模式）才会强制驱逐。
 
@@ -513,6 +555,13 @@ class SsdRun {
 ### 1.3.3 Entry 在 SSD 上的排布
 
 **Region 划分**：每个 SSD 文件内部按 **64MB region** 划分（`kRegionSize = 1 << 26`）。
+
+**设计选择：为什么是 64MB？**
+
+Region 大小是淘汰粒度与元数据开销的折衷：
+- **太小（如 4MB）**：淘汰粒度细，但同容量下 region 数量多，元数据开销（region score 校验与维护）增大
+- **太大（如 256MB）**：元数据开销低，但淘汰时可能连带丢弃有用数据（"连带伤害"大）
+- **64MB 平衡点**：与典型 Parquet Row Group / DWRF Stripe 大小相近，一次淘汰约 1-2 个行组的数据量
 
 **顺序写入**：一批 pins（从内存层收集而来）在同一个 region 内**顺序追加**。`SsdFile::getSpace()` 负责分配空间：
 
@@ -1151,53 +1200,13 @@ class CoalescedLoad {
 
 **并发场景**：两个 reader 同时请求同一批 region → 第一个进入 `kLoading`，第二个拿到 future 等待；完成后所有 entry 转 shared，双方都能读到。**等效于 IO 级别的 dedup**。
 
-### 1.7.3 makeSpace：反压与回退
+### 1.7.3 并发场景下的 makeSpace
 
-当内存吃紧时，`AsyncDataCache::makeSpace`（`AsyncDataCache.cpp:902-989`）展现了完整的反压策略：
+makeSpace 的详细实现见 §1.2.6。在并发场景下，多线程同时调用 makeSpace 时：
 
-```cpp
-bool AsyncDataCache::makeSpace(
-    MachinePageCount numPages,
-    std::function<bool(AcquiredMemory&)> allocate) {
-  const int32_t kMaxAttempts = numShards_ * 4;
-  int32_t rank = 0;   // 排队竞争位次
-
-  for (auto nthAttempt = 0; nthAttempt < kMaxAttempts; ++nthAttempt) {
-    if (canTryAllocate(requestBytes, acquired)) {
-      if (allocate(acquired)) return true;
-    }
-
-    // 反压 1：SSD 写入未完成时，等它一会
-    if (nthAttempt > 2 && ssdCache_ && ssdCache_->writeInProgress()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-
-    // 反压 2：有竞争 → 指数退避
-    if (rank) {
-      acquired.free(allocator_);
-      backoff(nthAttempt + rank);
-    }
-
-    // 轮询驱逐下一个 shard
-    shards_[shardCounter_++ & shardMask_]->evict(...);
-  }
-  return false;
-}
-```
-
-`backoff` 实现（`AsyncDataCache.cpp:1050-1057`）：
-
-```cpp
-void AsyncDataCache::backoff(int32_t counter) {
-  size_t seed = folly::hasher<uint16_t>()(++backoffCounter_);
-  const auto usecs = (seed & 0xfff) * (counter & 0x1f);
-  std::this_thread::sleep_for(std::chrono::microseconds(usecs));
-}
-```
-
-**两层反压**：
-1. **SSD 写入反压**：等 evict-to-SSD 完成（500ms 粒度）
-2. **竞争反压**：多线程同时 makeSpace 时，通过 `rank` 错开重试时机
+1. **SSD 写入反压**：等待 evict-to-SSD 完成（500ms 粒度）
+2. **竞争反压**：通过 `rank` 错开重试时机，避免多线程惊群
+3. **指数退避**：`backoff(nthAttempt + rank)` 随机延迟后重试
 
 ### 1.7.4 SSD 写并发控制
 
@@ -1503,6 +1512,29 @@ struct CacheRequest {
 ```
 
 `coalesces` 字段控制合并行为——稀疏列读到 loadQuantum 边界时会置为 false（见 §1.6.2）。
+
+### 2.3.4 CacheInputStream：IO 结果的流式封装
+
+`enqueue()` 返回的 `SeekableInputStream` 实际上是 `CacheInputStream`（`velox/dwio/common/CacheInputStream.{h,cpp}`）。它的作用是：
+
+- **延迟读取**：构造时不持有数据，仅记录 offset 和 size
+- **绑定缓存**：在 `load()` 阶段，`CachedBufferedInput` 将 CachePin 附加到每个 stream
+- **流式访问**：格式 Reader 调用 `read()` 时直接从已加载的缓存数据读取，无需额外 IO
+
+```cpp
+class CacheInputStream : public SeekableInputStream {
+  // 从缓存数据读取（load() 后才可用）
+  uint64_t read(void* buf, uint64_t length) override;
+  void seek(uint64_t offset) override;  // 支持跳转
+  
+ private:
+  CachePin pin_;           // 持有缓存数据
+  const char* buffer_;     // 指向缓存内存
+  uint64_t position_;      // 当前读位置
+};
+```
+
+这种设计将 **IO 计划**（enqueue+load）与 **数据消费**（从 stream 读）解耦，允许多个 stream 共享同一缓存 entry。
 
 ---
 
