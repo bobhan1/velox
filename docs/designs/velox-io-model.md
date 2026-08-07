@@ -848,11 +848,6 @@ Region 淘汰后**直接丢弃**，不做"回写内存"。淘汰流程（`SsdFil
 3. `writableRegions_ = candidates` 回收的 region 加入可写队列
 4. **被淘汰 region 里的 entry 不做"回写内存"**——内存里如果还有对应 CachePin，数据继续从内存读；内存里没有就等下次 cache miss 重读 storage
 
-**为什么不用回写内存？**
-- 被淘汰的 region 里的数据本来就冷（score 低）
-- 内存层驱逐时已经触发过 SSD 写入，内存里应该已经没有这些 entry
-- 如果内存里还有（比如刚读进来没来得及驱逐），继续从内存读即可
-
 **写入位置选择**：见 §1.3.3 的 `SsdFile::getSpace` 说明。
 
 ### 1.3.8 Checkpoint 与重启恢复
