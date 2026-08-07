@@ -842,9 +842,7 @@ std::vector<int32_t> SsdFileTracker::findEvictionCandidates(
 
 **淘汰后的数据一致性**：
 
-用户问到"SSD region 被淘汰之后里面就是直接丢掉了吗？"——答案是：**是的，直接丢弃**。
-
-淘汰流程（`SsdFile::growOrEvictLocked`）：
+Region 淘汰后**直接丢弃**，不做"回写内存"。淘汰流程（`SsdFile::growOrEvictLocked`）：
 1. `logEviction(candidates)` 写 eviction log（持久化）——下次重启时读 checkpoint + 重放 eviction log 就能知道哪些 region 失效了
 2. `clearRegionEntriesLocked` 清理 in-memory 的 `entries_` map
 3. `writableRegions_ = candidates` 回收的 region 加入可写队列
@@ -855,27 +853,7 @@ std::vector<int32_t> SsdFileTracker::findEvictionCandidates(
 - 内存层驱逐时已经触发过 SSD 写入，内存里应该已经没有这些 entry
 - 如果内存里还有（比如刚读进来没来得及驱逐），继续从内存读即可
 
-**SsdFile::write() 如何选位置**（`SsdFile.cpp:256-340` 的 `getSpace`）：
-
-```cpp
-std::optional<std::pair<uint64_t, int32_t>> SsdFile::getSpace(
-    const std::vector<CachePin>& pins, int32_t begin) {
-  for (;;) {
-    if (writableRegions_.empty()) {
-      if (!growOrEvictLocked()) return std::nullopt;        // 空间不够
-    }
-    const auto region = writableRegions_[0];
-    const auto offset = regionSizes_[region];
-    // 当前 region 装得下这批 pins 吗？
-    //   装得下 → 分配 offset
-    //   装不下 → 该 region 标记 filled，切下一个 region
-    if (regionFilled) {
-      tracker_.regionFilled(region);
-      writableRegions_.erase(writableRegions_.begin());
-    }
-  }
-}
-```
+**写入位置选择**：见 §1.3.3 的 `SsdFile::getSpace` 说明。
 
 ### 1.3.8 Checkpoint 与重启恢复
 
